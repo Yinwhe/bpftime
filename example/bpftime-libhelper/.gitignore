@@ -1,0 +1,36 @@
+# Build artifacts
+.output/
+*.o
+*.tmp.bpf.o
+*.bpf.o
+*.skel.h
+*.skel.json
+*.skel.yaml
+
+# Compiled binaries
+function_call_monitor
+test_target
+
+# Runtime logs
+runtime.log
+*.log
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
