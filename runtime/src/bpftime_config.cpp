@@ -130,9 +130,43 @@ agent_config bpftime::construct_agent_config_from_env() noexcept
 		agent_config.set_vm_name(vm_name);
 	}
 
+	const char *verifier_level = std::getenv("BPFTIME_VERIFIER_LEVEL");
+	if (verifier_level != nullptr) {
+		std::string_view level_sv(verifier_level);
+		if (level_sv == "STRICT") {
+			agent_config.verifier_mode = BPFTIME_VERIFIER_STRICT;
+			SPDLOG_INFO("Verifier mode: STRICT");
+		} else if (level_sv == "WARNING") {
+			agent_config.verifier_mode = BPFTIME_VERIFIER_WARNING;
+			SPDLOG_INFO("Verifier mode: WARNING");
+		} else if (level_sv == "NO_VERIFY") {
+			agent_config.verifier_mode = BPFTIME_NO_VERIFY;
+			SPDLOG_INFO("Verifier mode: NO_VERIFY");
+		} else {
+			SPDLOG_WARN(
+				"Unknown BPFTIME_VERIFIER_LEVEL value: {}. "
+				"Valid values: STRICT, WARNING, NO_VERIFY. "
+				"Defaulting to WARNING.",
+				verifier_level);
+		}
+	}
+
 	const char *logger_target = std::getenv("BPFTIME_LOG_OUTPUT");
 	if (logger_target != nullptr) {
 		agent_config.set_logger_output_path(logger_target);
+	}
+
+	// Optional GDRCopy knobs for GPU map host-side lookup.
+	// Keep env parsing here (single place) to avoid sprinkling getenv() across modules.
+	if (const char *enable_gdrcopy = std::getenv("BPFTIME_GPU_ARRAY_GDRCOPY");
+	    enable_gdrcopy != nullptr && enable_gdrcopy[0] == '1') {
+		agent_config.enable_gpu_gdrcopy = true;
+	}
+	if (auto max_bytes = parse_numeric_env<unsigned long>(
+		    "BPFTIME_GPU_ARRAY_GDRCOPY_MAX_PER_KEY_BYTES", 0ul,
+		    1024ul * 1024ul * 1024ul)) {
+		agent_config.gpu_gdrcopy_max_per_key_bytes =
+			static_cast<uint64_t>(*max_bytes);
 	}
 	return agent_config;
 }

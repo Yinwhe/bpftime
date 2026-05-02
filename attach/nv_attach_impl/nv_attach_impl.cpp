@@ -1,18 +1,28 @@
 #include "nv_attach_impl.hpp"
 #include "cuda_runtime_api.h"
 #include "driver_types.h"
+#include "ebpf_inst.h"
 #include "frida-gum.h"
 
-#include "llvm_jit_context.hpp"
+#include "nvPTXCompiler.h"
 #include "nv_attach_private_data.hpp"
+#include "nv_attach_utils.hpp"
+#include "ptx_compiler/ptx_compiler.hpp"
+// #include "spdlog/common.h"
 #include "spdlog/spdlog.h"
 #include <asm/unistd.h> // For architecture-specific syscall numbers
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/thread_pool.hpp>
+#include <boost/process.hpp>
 #include <boost/process/detail/child_decl.hpp>
 #include <boost/process/env.hpp>
 #include <boost/process/io.hpp>
 #include <boost/process/pipe.hpp>
+#include <boost/process/start_dir.hpp>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <cassert>
 #include <cstdint>
@@ -21,24 +31,51 @@
 #include <dlfcn.h>
 #include <filesystem>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sstream>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <sys/uio.h>
 #include <link.h>
-// #include <pos/cuda_impl/utils/fatbin.h>
-#include <thread>
+#include <tuple>
 #include <unistd.h>
 #include <variant>
 #include <vector>
 #include <boost/asio.hpp>
-#include <boost/process.hpp>
+#include "ptxpass/core.hpp"
+#include "ptx_pass_config.h"
 using namespace bpftime;
 using namespace attach;
+static std::vector<std::filesystem::path> split_by_colon(const std::string &str)
+{
+	std::vector<std::filesystem::path> result;
+
+	char *buffer = new char[str.length() + 1];
+	strcpy(buffer, str.c_str());
+
+	char *token = strtok(buffer, ":");
+	while (token != nullptr) {
+		result.push_back(token);
+		token = strtok(nullptr, ":");
+	}
+
+	delete[] buffer;
+	return result;
+}
+#define CUDA_DRIVER_CHECK_NO_EXCEPTION(expr, message)                          \
+	do {                                                                   \
+		if (auto err = expr; err != CUDA_SUCCESS) {                    \
+			SPDLOG_ERROR("{}: {}", message, (int)err);             \
+		}                                                              \
+	} while (false)
 
 extern GType cuda_runtime_function_hooker_get_type();
 
@@ -48,120 +85,161 @@ int nv_attach_impl::detach_by_id(int id)
 	return 0;
 }
 
+void nv_attach_impl::register_custom_helpers(
+	ebpf_helper_register_callback register_callback)
+{
+}
+
 int nv_attach_impl::create_attach_with_ebpf_callback(
 	ebpf_run_callback &&cb, const attach_private_data &private_data,
 	int attach_type)
 {
-	// if (this->hook_entries.size() >= 1) {
-	// 	SPDLOG_ERROR("Only one nv attach could be used");
-	// 	return -1;
-	// }
 	auto data = dynamic_cast<const nv_attach_private_data &>(private_data);
-	if (attach_type == ATTACH_CUDA_PROBE) {
-		if (std::get<std::string>(data.code_addr_or_func_name) ==
-		    "__memcapture") {
-			SPDLOG_INFO("Recording memcapture in nv_attach_impl");
-			auto id = this->allocate_id();
-			hook_entries[id] = nv_attach_entry{
-				.type = nv_attach_cuda_memcapture{},
-				.instuctions = data.instructions,
-				.kernels = data.func_names
-			};
-			this->map_basic_info = data.map_basic_info;
-			this->shared_mem_ptr = data.comm_shared_mem;
-			return id;
-		} else {
-			SPDLOG_INFO("Recording kprobe for {}",
-				    std::get<std::string>(
-					    data.code_addr_or_func_name));
-			auto id = this->allocate_id();
-			hook_entries[id] = nv_attach_entry{
-				.type =
-					nv_attach_function_probe{
-						.func = std::get<std::string>(
-							data.code_addr_or_func_name),
-						.is_retprobe = false,
-					},
-				.instuctions = data.instructions,
-				.kernels = data.func_names
-			};
-			this->map_basic_info = data.map_basic_info;
-			this->shared_mem_ptr = data.comm_shared_mem;
-			return id;
-		}
-	} else if (attach_type == ATTACH_CUDA_RETPROBE) {
-		SPDLOG_INFO("Recording kretprobe for {}",
-			    std::get<std::string>(data.code_addr_or_func_name));
-		auto id = this->allocate_id();
-		hook_entries[id] = nv_attach_entry{
-			.type =
-				nv_attach_function_probe{
-					.func = std::get<std::string>(
-						data.code_addr_or_func_name),
-					.is_retprobe = true,
-				},
-			.instuctions = data.instructions,
-			.kernels = data.func_names
-		};
-		this->map_basic_info = data.map_basic_info;
-		this->shared_mem_ptr = data.comm_shared_mem;
-		return id;
-	} else {
-		SPDLOG_ERROR("Unsupported attach type for nv_attach_impl: {}",
-			     attach_type);
+
+	// Safely access the variant
+	if (!std::holds_alternative<std::string>(data.code_addr_or_func_name)) {
+		SPDLOG_ERROR(
+			"code_addr_or_func_name does not hold a string value");
 		return -1;
 	}
-	return 0;
+	const auto &func_name =
+		std::get<std::string>(data.code_addr_or_func_name);
+	std::string attach_point_name;
+	if (attach_type == ATTACH_CUDA_PROBE) {
+		attach_point_name = "kprobe/" + func_name;
+	} else if (attach_type == ATTACH_CUDA_RETPROBE) {
+		attach_point_name = "kretprobe/" + func_name;
+	} else {
+		attach_point_name = func_name;
+	}
+	struct pass_cfg_with_exec_path *matched = nullptr;
+	for (const auto &pd : this->pass_configurations) {
+		if (pd->pass_config.attach_type != attach_type)
+			continue;
+		ptxpass::AttachPointMatcher matcher(
+			pd->pass_config.attach_points);
+
+		if (matcher.matches(attach_point_name)) {
+			matched = pd.get();
+			break; // pass_definitions is sorted deterministically
+			       // by executable
+		}
+	}
+	if (matched) {
+		auto id = this->allocate_id();
+		nv_attach_entry entry;
+		entry.instuctions = data.instructions;
+		entry.kernels = data.func_names;
+		entry.program_name = data.program_name;
+		entry.config = matched;
+
+		hook_entries[id] = std::move(entry);
+		this->map_basic_info = data.map_basic_info;
+		if (data.comm_shared_mem == 0) {
+			SPDLOG_ERROR(
+				"comm_shared_mem is null when creating CUDA attach for {}",
+				func_name);
+			return -1;
+		}
+		if (this->shared_mem_ptr == 0) {
+			this->shared_mem_ptr = data.comm_shared_mem;
+			SPDLOG_INFO("Cached shared_mem_ptr at {:x}",
+				    (uintptr_t)this->shared_mem_ptr);
+		} else if (this->shared_mem_ptr != data.comm_shared_mem) {
+			SPDLOG_WARN(
+				"Ignoring new comm_shared_mem {:x}; already using {:x}",
+				(uintptr_t)data.comm_shared_mem,
+				(uintptr_t)this->shared_mem_ptr);
+		}
+		SPDLOG_INFO("Recorded pass {} for func {}",
+			    matched->executable_path.c_str(), func_name);
+		return id;
+	}
+	// No matched definition: do not create generic entry; require explicit
+	// pass definition to avoid ambiguous instrumentation.
+	SPDLOG_WARN(
+		"No pass definition matched for function {}, attach_type {}. Skipping.",
+		attach_point_name, attach_type);
+	return -1;
 }
+
+extern "C" {
+cudaError_t cuda_runtime_function__cudaLaunchKernel(const void *func,
+						    dim3 gridDim, dim3 blockDim,
+						    void **args,
+						    size_t sharedMem,
+						    cudaStream_t stream);
+cudaError_t cuda_runtime_function__cudaLaunchKernel_ptsz(
+	const void *func, dim3 gridDim, dim3 blockDim, void **args,
+	size_t sharedMem, cudaStream_t stream);
+CUresult cuda_driver_function__cuGraphAddKernelNode_v1(
+	CUgraphNode *phGraphNode, CUgraph hGraph,
+	const CUgraphNode *dependencies, size_t numDependencies,
+	const CUDA_KERNEL_NODE_PARAMS_v1 *nodeParams);
+CUresult cuda_driver_function__cuGraphAddKernelNode_v2(
+	CUgraphNode *phGraphNode, CUgraph hGraph,
+	const CUgraphNode *dependencies, size_t numDependencies,
+	const CUDA_KERNEL_NODE_PARAMS_v2 *nodeParams);
+CUresult cuda_driver_function__cuGraphExecKernelNodeSetParams_v1(
+	CUgraphExec hGraphExec, CUgraphNode hNode,
+	const CUDA_KERNEL_NODE_PARAMS_v1 *nodeParams);
+CUresult cuda_driver_function__cuGraphExecKernelNodeSetParams_v2(
+	CUgraphExec hGraphExec, CUgraphNode hNode,
+	const CUDA_KERNEL_NODE_PARAMS_v2 *nodeParams);
+CUresult cuda_driver_function__cuGraphKernelNodeSetParams_v1(
+	CUgraphNode hNode, const CUDA_KERNEL_NODE_PARAMS_v1 *nodeParams);
+CUresult cuda_driver_function__cuGraphKernelNodeSetParams_v2(
+	CUgraphNode hNode, const CUDA_KERNEL_NODE_PARAMS_v2 *nodeParams);
+cudaError_t cuda_runtime_function__cudaMemcpyFromSymbol(
+	void *dst, const void *symbol, size_t count, size_t offset = 0,
+	cudaMemcpyKind kind = cudaMemcpyDeviceToHost);
+cudaError_t cuda_runtime_function__cudaMemcpyFromSymbolAsync(
+	void *dst, const void *symbol, size_t count, size_t offset,
+	cudaMemcpyKind kind, cudaStream_t stream = 0);
+}
+
 nv_attach_impl::nv_attach_impl()
 {
 	SPDLOG_INFO("Starting nv_attach_impl");
+	// Ensure CUDA driver library is loaded before we attempt to hook driver
+	// APIs such as cuGraph*.
+	{
+		void *handle = dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+		if (handle == nullptr) {
+			SPDLOG_DEBUG("dlopen(libcuda.so.1) failed: {}",
+				     dlerror());
+		}
+	}
+	this->module_pool = std::make_shared<
+		std::map<std::string, std::shared_ptr<ptx_in_module>>>();
+	this->ptx_pool =
+		std::make_shared<std::map<std::string, std::vector<uint8_t>>>();
+
+	this->shared_mem_ptr = 0;
 	gum_init_embedded();
 	auto interceptor = gum_interceptor_obtain();
-	assert(interceptor != nullptr);
+	if (interceptor == nullptr) {
+		SPDLOG_ERROR("Failed to obtain Frida interceptor");
+		throw std::runtime_error(
+			"Failed to initialize Frida interceptor");
+	}
 	auto listener =
 		g_object_new(cuda_runtime_function_hooker_get_type(), nullptr);
-	assert(listener != nullptr);
+	if (listener == nullptr) {
+		SPDLOG_ERROR("Failed to create Frida listener");
+		throw std::runtime_error("Failed to initialize Frida listener");
+	}
 	this->frida_interceptor = interceptor;
 	this->frida_listener = listener;
-	// Lambda: 获取当前线程 TID（Linux 特有）
-	// auto get_tid = []() -> pid_t {
-	// 	return static_cast<pid_t>(syscall(SYS_gettid));
-	// };
-
-	// // Lambda: 读取 /proc/<pid>/task/<tid>/children，返回子进程 PID 列表
-	// auto list_children = [](pid_t pid, pid_t tid) -> std::vector<pid_t> {
-	// 	std::vector<pid_t> children;
-	// 	std::string path = "/proc/" + std::to_string(pid) + "/task/" +
-	// 			   std::to_string(tid) + "/children";
-
-	// 	std::ifstream ifs(path);
-	// 	if (!ifs.is_open()) {
-	// 		std::perror(("open " + path).c_str());
-	// 		return children;
-	// 	}
-
-	// 	std::string line;
-	// 	if (std::getline(ifs, line)) {
-	// 		std::istringstream iss(line);
-	// 		pid_t cpid;
-	// 		while (iss >> cpid) {
-	// 			children.push_back(cpid);
-	// 		}
-	// 	}
-	// 	return children;
-	// };
-
-	// pid_t pid = getpid(); // 当前进程 PID
-	// pid_t tid = get_tid(); // 当前线程 TID
-
-	// auto kids = list_children(pid, tid);
-	// this->injector = std::make_unique<CUDAInjector>(kids[0]);
-	// this->injector = std::make_unique<CUDAInjector>(getpid());
-
 	gum_interceptor_begin_transaction(interceptor);
 
 	auto register_hook = [&](AttachedToFunction func, void *addr) {
+		if (addr == nullptr) {
+			SPDLOG_WARN(
+				"Skipping hook registration for function {} - symbol not found",
+				(int)func);
+			return;
+		}
 		auto ctx = std::make_unique<CUDARuntimeFunctionHookerContext>();
 		ctx->to_function = func;
 		ctx->impl = this;
@@ -171,266 +249,747 @@ nv_attach_impl::nv_attach_impl()
 			    interceptor, (gpointer)addr,
 			    (GumInvocationListener *)listener, ctx_ptr);
 		    result != GUM_ATTACH_OK) {
-			SPDLOG_ERROR("Unable to attach to CUDA functions: {}",
-				     (int)result);
+			SPDLOG_ERROR(
+				"Unable to attach to CUDA functions: func={}, err={}",
+				(int)func, (int)result);
+			throw std::runtime_error(
+				"Failed to attach to CUDA function");
+		}
+	};
+	auto replace_hook = [&](const char *symbol_name, gpointer replacement,
+				void **original_storage) {
+		void *addr = GSIZE_TO_POINTER(
+			gum_module_find_export_by_name(nullptr, symbol_name));
+		if (addr == nullptr) {
+			SPDLOG_DEBUG(
+				"Skipping replace hook for {} - symbol not found",
+				symbol_name);
+			return;
+		}
+		if (auto err = gum_interceptor_replace(
+			    interceptor, addr, replacement, this,
+			    (gpointer *)original_storage);
+		    err != GUM_REPLACE_OK) {
+			SPDLOG_ERROR("Unable to replace {}: {}", symbol_name,
+				     (int)err);
 			assert(false);
 		}
 	};
-	register_hook(AttachedToFunction::RegisterFatbin,
-		      (gpointer)dlsym(RTLD_NEXT, "__cudaRegisterFatBinary"));
 
-	register_hook(AttachedToFunction::RegisterFunction,
-		      GSIZE_TO_POINTER(gum_module_find_export_by_name(
-			      nullptr, "__cudaRegisterFunction")));
-	register_hook(AttachedToFunction::RegisterFatbinEnd,
-		      GSIZE_TO_POINTER(gum_module_find_export_by_name(
-			      nullptr, "__cudaRegisterFatBinaryEnd")));
-	register_hook(AttachedToFunction::CudaLaunchKernel,
-		      GSIZE_TO_POINTER(gum_module_find_export_by_name(
-			      nullptr, "cudaLaunchKernel")));
+	{
+		void *register_fatbin_addr =
+			dlsym(RTLD_NEXT, "__cudaRegisterFatBinary");
+		register_hook(AttachedToFunction::RegisterFatbin,
+			      register_fatbin_addr);
+	}
+	{
+		void *register_function_addr =
+			GSIZE_TO_POINTER(gum_module_find_export_by_name(
+				nullptr, "__cudaRegisterFunction"));
+		register_hook(AttachedToFunction::RegisterFunction,
+			      register_function_addr);
+	}
+	{
+		void *register_variable_addr =
+			GSIZE_TO_POINTER(gum_module_find_export_by_name(
+				nullptr, "__cudaRegisterVar"));
+		register_hook(AttachedToFunction::RegisterVariable,
+			      register_variable_addr);
+	}
+	{
+		void *register_fatbin_end_addr =
+			GSIZE_TO_POINTER(gum_module_find_export_by_name(
+				nullptr, "__cudaRegisterFatBinaryEnd"));
+		register_hook(AttachedToFunction::RegisterFatbinEnd,
+			      register_fatbin_end_addr);
+	}
 
+	{
+		void *cuda_malloc_addr = GSIZE_TO_POINTER(
+			gum_module_find_export_by_name(nullptr, "cudaMalloc"));
+		register_hook(AttachedToFunction::CudaMalloc, cuda_malloc_addr);
+	}
+	{
+		void *cuda_malloc_managed_addr =
+			GSIZE_TO_POINTER(gum_module_find_export_by_name(
+				nullptr, "cudaMallocManaged"));
+		register_hook(AttachedToFunction::CudaMallocManaged,
+			      cuda_malloc_managed_addr);
+	}
+	{
+		void *cuda_memcpy_to_symbol_addr =
+			GSIZE_TO_POINTER(gum_module_find_export_by_name(
+				nullptr, "cudaMemcpyToSymbol"));
+		register_hook(AttachedToFunction::CudaMemcpyToSymbol,
+			      cuda_memcpy_to_symbol_addr);
+	}
+	{
+		void *cuda_memcpy_to_symbol_async_addr =
+			GSIZE_TO_POINTER(gum_module_find_export_by_name(
+				nullptr, "cudaMemcpyToSymbolAsync"));
+		register_hook(AttachedToFunction::CudaMemcpyToSymbolAsync,
+			      cuda_memcpy_to_symbol_async_addr);
+	}
+	{
+		replace_hook("cudaLaunchKernel",
+			     (gpointer)&cuda_runtime_function__cudaLaunchKernel,
+			     &this->original_cuda_launch_kernel);
+	}
+	replace_hook("cudaLaunchKernel_ptsz",
+		     (gpointer)&cuda_runtime_function__cudaLaunchKernel_ptsz,
+		     &this->original_cuda_launch_kernel_ptsz);
+	replace_hook("cuGraphAddKernelNode",
+		     (gpointer)&cuda_driver_function__cuGraphAddKernelNode_v1,
+		     &this->original_cu_graph_add_kernel_node_v1);
+	replace_hook("cuGraphAddKernelNode_v2",
+		     (gpointer)&cuda_driver_function__cuGraphAddKernelNode_v2,
+		     &this->original_cu_graph_add_kernel_node_v2);
+	replace_hook(
+		"cuGraphExecKernelNodeSetParams",
+		(gpointer)&cuda_driver_function__cuGraphExecKernelNodeSetParams_v1,
+		&this->original_cu_graph_exec_kernel_node_set_params_v1);
+	replace_hook(
+		"cuGraphExecKernelNodeSetParams_v2",
+		(gpointer)&cuda_driver_function__cuGraphExecKernelNodeSetParams_v2,
+		&this->original_cu_graph_exec_kernel_node_set_params_v2);
+	replace_hook(
+		"cuGraphKernelNodeSetParams",
+		(gpointer)&cuda_driver_function__cuGraphKernelNodeSetParams_v1,
+		&this->original_cu_graph_kernel_node_set_params_v1);
+	replace_hook(
+		"cuGraphKernelNodeSetParams_v2",
+		(gpointer)&cuda_driver_function__cuGraphKernelNodeSetParams_v2,
+		&this->original_cu_graph_kernel_node_set_params_v2);
+	replace_hook("cudaMemcpyFromSymbol",
+		     (gpointer)&cuda_runtime_function__cudaMemcpyFromSymbol,
+		     &this->original_cuda_memcpy_from_symbol);
+	replace_hook(
+		"cudaMemcpyFromSymbolAsync",
+		(gpointer)&cuda_runtime_function__cudaMemcpyFromSymbolAsync,
+		&this->original_cuda_memcpy_from_symbol_async);
 	gum_interceptor_end_transaction(interceptor);
+
+	static const char *ptx_pass_libraries = DEFAULT_PTX_PASS_EXECUTABLE;
+	std::vector<std::filesystem::path> pass_libraries;
+	{
+		const char *provided_libraries =
+			getenv("BPFTIME_PTXPASS_LIBRARIES");
+		if (provided_libraries && strlen(provided_libraries) > 0) {
+			ptx_pass_libraries = provided_libraries;
+			SPDLOG_INFO(
+				"Parsing user provided (by BPFTIME_PTXPASS_LIBRARIES) libraries: {}",
+				provided_libraries);
+		} else {
+			SPDLOG_INFO("Parsing bundled libraries: {}",
+				    ptx_pass_libraries);
+		}
+	}
+	auto paths = split_by_colon(ptx_pass_libraries);
+	for (const auto &path : paths) {
+		SPDLOG_INFO("Found path: {}, executing..", path.c_str());
+		void *handle = dlmopen(LM_ID_NEWLM, path.c_str(),
+				       RTLD_NOW | RTLD_LOCAL);
+		if (!handle) {
+			SPDLOG_ERROR(
+				"Unable to load dynamic library of pass {}: {}",
+				path.c_str(), dlerror());
+			continue;
+		}
+		auto print_config =
+			(print_config_fn)dlsym(handle, "print_config");
+		if (!print_config) {
+			SPDLOG_ERROR("Symbol print_config not found in {}",
+				     path.c_str());
+			continue;
+		}
+		auto process_input =
+			(process_input_fn)dlsym(handle, "process_input");
+		if (!process_input) {
+			SPDLOG_ERROR("Symbol process_input not found in {}",
+				     path.c_str());
+			continue;
+		}
+		ptxpass::pass_config::PassConfig config;
+		std::vector<char> buf(10 << 20);
+		print_config(buf.size(), buf.data());
+
+		auto json = nlohmann::json::parse(buf.data());
+		ptxpass::pass_config::from_json(json, config);
+		SPDLOG_INFO("Retrived config of {}", path.c_str());
+		SPDLOG_DEBUG("Config {}", json.dump(4));
+		this->pass_configurations.emplace_back(
+			std::make_unique<pass_cfg_with_exec_path>(
+				path, config, print_config, process_input,
+				handle));
+	}
+	{
+		this->ptx_compiler = *load_nv_attach_impl_ptx_compiler(
+			DEFAULT_PTX_COMPILER_SHARED_LIB,
+			this->ptx_compiler_dl_handle);
+	}
+}
+
+static void
+revert_frida_replaced_exports_if_present(GumInterceptor *interceptor,
+					 const char *const *symbols,
+					 size_t symbol_count)
+{
+	if (interceptor == nullptr || symbols == nullptr || symbol_count == 0)
+		return;
+	for (size_t i = 0; i < symbol_count; i++) {
+		void *addr = GSIZE_TO_POINTER(
+			gum_module_find_export_by_name(nullptr, symbols[i]));
+		if (addr != nullptr)
+			gum_interceptor_revert(interceptor, addr);
+	}
 }
 
 nv_attach_impl::~nv_attach_impl()
 {
-	if (frida_listener)
+	if (frida_interceptor != nullptr) {
+		auto interceptor = (GumInterceptor *)frida_interceptor;
+		gum_interceptor_begin_transaction(interceptor);
+
+		if (frida_listener != nullptr) {
+			gum_interceptor_detach(
+				interceptor,
+				(GumInvocationListener *)frida_listener);
+		}
+
+		static const char *const replaced_symbols[] = {
+			"cudaLaunchKernel",
+			"cudaLaunchKernel_ptsz",
+			"cuGraphAddKernelNode",
+			"cuGraphAddKernelNode_v2",
+			"cuGraphExecKernelNodeSetParams",
+			"cuGraphExecKernelNodeSetParams_v2",
+			"cuGraphKernelNodeSetParams",
+			"cuGraphKernelNodeSetParams_v2",
+		};
+		revert_frida_replaced_exports_if_present(
+			interceptor, replaced_symbols,
+			std::size(replaced_symbols));
+
+		gum_interceptor_end_transaction(interceptor);
+	}
+
+	if (frida_listener) {
 		g_object_unref(frida_listener);
+		frida_listener = nullptr;
+	}
+	if (ptx_compiler_dl_handle) {
+		dlclose(ptx_compiler_dl_handle);
+	}
 }
 
-std::optional<std::vector<uint8_t>>
-nv_attach_impl::hack_fatbin(std::vector<uint8_t> &&data_vec)
+void nv_attach_impl::record_patched_kernel_function(
+	const std::string &kernel_name, CUfunction function)
 {
-	std::vector<std::string> ptx_out;
+	if (kernel_name.empty() || function == nullptr)
+		return;
+	std::lock_guard<std::mutex> guard(cuda_symbol_map_mutex);
+	auto itr = patched_kernel_by_name.find(kernel_name);
+	if (itr == patched_kernel_by_name.end()) {
+		patched_kernel_by_name.emplace(kernel_name, function);
+		return;
+	}
+	if (itr->second != function)
+		itr->second = function;
+}
+
+std::optional<CUfunction> nv_attach_impl::find_patched_kernel_function(
+	const std::string &kernel_name) const
+{
+	if (kernel_name.empty())
+		return std::nullopt;
+	std::lock_guard<std::mutex> guard(cuda_symbol_map_mutex);
+	auto itr = patched_kernel_by_name.find(kernel_name);
+	if (itr == patched_kernel_by_name.end())
+		return std::nullopt;
+	return itr->second;
+}
+
+void nv_attach_impl::record_original_cufunction_name(
+	CUfunction function, const std::string &kernel_name)
+{
+	if (function == nullptr || kernel_name.empty())
+		return;
+	std::lock_guard<std::mutex> guard(cuda_symbol_map_mutex);
+	auto itr = kernel_name_by_cufunction.find(function);
+	if (itr == kernel_name_by_cufunction.end()) {
+		kernel_name_by_cufunction.emplace(function, kernel_name);
+		return;
+	}
+	if (itr->second != kernel_name)
+		itr->second = kernel_name;
+}
+
+std::optional<std::string>
+nv_attach_impl::find_original_kernel_name(CUfunction function) const
+{
+	if (function == nullptr)
+		return std::nullopt;
+	std::lock_guard<std::mutex> guard(cuda_symbol_map_mutex);
+	auto itr = kernel_name_by_cufunction.find(function);
+	if (itr == kernel_name_by_cufunction.end())
+		return std::nullopt;
+	return itr->second;
+}
+
+std::map<std::string, std::string>
+nv_attach_impl::extract_ptxs(std::vector<uint8_t> &&data_vec)
+{
+	std::map<std::string, std::string> all_ptx;
+	char tmp_dir[] = "/tmp/bpftime-fatbin-work.XXXXXX";
+	mkdtemp(tmp_dir);
+	auto working_dir = std::filesystem::path(tmp_dir);
+	auto fatbin_path = working_dir / "temp.fatbin";
 	{
-		char tmp_dir[] = "/tmp/bpftime-fatbin-store.XXXXXX";
-		mkdtemp(tmp_dir);
-		auto output_path =
-			std::filesystem::path(tmp_dir) / "temp.fatbin";
-		{
-			std::ofstream ofs(output_path, std::ios::binary);
-			ofs.write((const char *)data_vec.data(),
-				  data_vec.size());
-			SPDLOG_INFO("Temporary fatbin written to {}",
-				    output_path.c_str());
-		}
-		SPDLOG_INFO("Listing functions in the patched ptx");
-		boost::asio::io_context ctx;
-		boost::process::ipstream stream;
-		boost::process::environment env =
-			boost::this_process::environment();
-		env["LD_PRELOAD"] = "";
+		std::ofstream ofs(fatbin_path, std::ios::binary);
+		ofs.write((const char *)data_vec.data(), data_vec.size());
+		SPDLOG_INFO("Temporary fatbin written to {}",
+			    fatbin_path.c_str());
+	}
+	SPDLOG_INFO("Extracting PTX in the fatbin...");
+	boost::asio::io_context ctx;
+	boost::process::ipstream stream;
+	boost::process::environment env = boost::this_process::environment();
+	env["LD_PRELOAD"] = "";
 
-		boost::process::child child(
-			std::string("cuobjdump --dump-ptx ") +
-				output_path.string(),
-			boost::process::std_out > stream,
-			boost::process::env(env));
-		std::string line;
-		std::string output;
-		bool should_record = false;
-		while (stream && std::getline(stream, line)) {
-			if (should_record) {
-				output += line + "\n";
-			}
-			if (line.starts_with("ptxasOptions = "))
-				should_record = true;
-		}
-		ptx_out.push_back(output);
-		{
-			auto temp_out =
-				std::filesystem::path(tmp_dir) / "temp.ptx";
-			std::ofstream export_ofs(temp_out);
-			export_ofs << output;
-			SPDLOG_INFO("Extracted PTX at {}", temp_out.c_str());
+	// Build command line - use shell to properly search PATH
+	auto cuobjdump_cmd_line = std::string("cuobjdump --extract-ptx all ") +
+				  fatbin_path.string();
+	SPDLOG_INFO("Calling cuobjdump: {}", cuobjdump_cmd_line);
+
+	// Execute through shell to properly use PATH
+	boost::process::child child(
+		"/bin/sh", boost::process::args({ "-c", cuobjdump_cmd_line }),
+		boost::process::std_out > stream, boost::process::env(env),
+		boost::process::start_dir = tmp_dir);
+
+	std::string line;
+	while (std::getline(stream, line)) {
+		SPDLOG_DEBUG("cuobjdump output: {}", line);
+	}
+	for (const auto &entry :
+	     std::filesystem::directory_iterator(working_dir)) {
+		if (entry.is_regular_file() &&
+		    entry.path().string().ends_with(".ptx")) {
+			// Read the PTX into memory
+			std::ifstream ifs(entry.path());
+			std::stringstream buffer;
+			buffer << ifs.rdbuf();
+			all_ptx[entry.path().filename()] = buffer.str();
 		}
 	}
-	if (ptx_out.size() != 1) {
-		SPDLOG_ERROR(
-			"Expect the loaded fatbin to contain only 1 PTX code section, but it contains {}",
-			ptx_out.size());
-		return {};
+	if (!spdlog::should_log(spdlog::level::debug)) {
+		SPDLOG_INFO("Remove extracted files..");
+		std::filesystem::remove_all(working_dir);
 	}
-
+	SPDLOG_INFO("Got {} PTX files", all_ptx.size());
+	return all_ptx;
+}
+std::optional<std::map<std::string, std::tuple<std::string, bool>>>
+nv_attach_impl::hack_fatbin(std::map<std::string, std::string> all_ptx)
+{
 	/**
-	Here we can patch the PTX. Then recompile it.
+	Here we can patch the PTX.
 	*/
-	bool trampoline_added = false;
-	auto &to_patch_ptx = ptx_out[0];
-	to_patch_ptx = filter_unprintable_chars(to_patch_ptx);
-	for (const auto &[_, entry] : hook_entries) {
-		if (std::holds_alternative<nv_attach_cuda_memcapture>(
-			    entry.type)) {
-			SPDLOG_INFO("Patching with memcapture..");
-			if (auto result = this->patch_with_memcapture(
-				    to_patch_ptx, entry, !trampoline_added);
-			    result.has_value()) {
-				to_patch_ptx = *result;
-				trampoline_added = true;
-			} else {
-				SPDLOG_ERROR("Failed to patch for memcapture");
-				return {};
+	boost::asio::thread_pool pool(std::thread::hardware_concurrency());
+	std::map<std::string, std::tuple<std::string, bool>> ptx_out;
+	std::mutex map_mutex;
+	std::mutex cache_mutex;
+	for (auto &[file_name, original_ptx] : all_ptx) {
+		boost::asio::post(pool, [this, original_ptx, file_name, &map_mutex, &ptx_out, &cache_mutex]() -> void {
+			auto current_ptx = original_ptx;
+			SPDLOG_INFO("Patching PTX: {}", file_name);
+			bool should_add_trampoline = false;
+			for (const auto &[_, hook_entry] : this->hook_entries) {
+				const auto &kernels = hook_entry.kernels;
+				for (const auto &kernel : kernels) {
+					std::vector<uint64_t> ebpf_inst_words;
+					ebpf_inst_words.assign(
+						(uint64_t *)(uintptr_t)hook_entry
+							.instuctions.data(),
+						(uint64_t *)(uintptr_t)hook_entry
+								.instuctions
+								.data() +
+							hook_entry.instuctions
+								.size()
+
+					);
+					ptxpass::runtime_request::RuntimeRequest
+						req;
+					auto &ri = req.input;
+					ri.full_ptx = current_ptx;
+					ri.to_patch_kernel = kernel;
+					ri.global_ebpf_map_info_symbol =
+						"map_info";
+					ri.ebpf_communication_data_symbol =
+						"constData";
+
+					req.set_ebpf_instructions(
+						ebpf_inst_words);
+					nlohmann::json in;
+					ptxpass::runtime_request::to_json(in,
+									  req);
+					auto input_json = in.dump();
+					SPDLOG_DEBUG("Input: {}", input_json);
+					auto sha256_string =
+						sha256(input_json.data(),
+						       input_json.size());
+
+					ptxpass::runtime_response::RuntimeResponse
+						resp;
+
+					cache_mutex.lock();
+					if (auto itr = this->patch_cache.find(
+						    sha256_string);
+					    itr != this->patch_cache.end()) {
+						SPDLOG_INFO(
+							"Patching request {} found in cache",
+							sha256_string);
+						resp = itr->second;
+						cache_mutex.unlock();
+					} else {
+						cache_mutex.unlock();
+						SPDLOG_INFO(
+							"Patching request {} not found in cache, patching..",
+							sha256_string);
+						std::vector<char> buf(1 << 30);
+						int err =
+							hook_entry.config->process_input(
+								input_json
+									.c_str(),
+								buf.size(),
+								buf.data());
+
+						if (err ==
+						    ptxpass::ExitCode::Success) {
+							auto json = nlohmann::json::
+								parse(buf.data());
+							using namespace ptxpass::
+								runtime_response;
+
+							from_json(json, resp);
+
+						} else {
+							SPDLOG_ERROR(
+								"Unable to run pass on kernel {}: {}",
+								kernel,
+								(int)err);
+							return;
+						}
+						std::lock_guard<std::mutex>
+							_cache_guard(
+								cache_mutex);
+						patch_cache[sha256_string] =
+							resp;
+					}
+					current_ptx = resp.output_ptx;
+					should_add_trampoline =
+						should_add_trampoline ||
+						resp.modified;
+				}
 			}
-		} else if (std::holds_alternative<nv_attach_function_probe>(
-				   entry.type)) {
-			SPDLOG_INFO("Patching with kprobe/kretprobe");
-			if (auto result = this->patch_with_probe_and_retprobe(
-				    to_patch_ptx, entry, !trampoline_added);
-			    result.has_value()) {
-				to_patch_ptx = *result;
-				trampoline_added = true;
-			} else {
-				SPDLOG_ERROR(
-					"Failed to patch for probe/retprobe");
-				return {};
+			if (should_add_trampoline) {
+				current_ptx =
+					ptxpass::filter_out_version_headers_ptx(
+						wrap_ptx_with_trampoline(
+							current_ptx));
 			}
+			std::lock_guard<std::mutex> _guard(map_mutex);
+			ptx_out["patched." + file_name] = std::make_tuple(
+				current_ptx, should_add_trampoline);
+		});
+	}
+	pool.join();
+	if (spdlog::should_log(spdlog::level::debug)) {
+		char tmp_dir[] = "/tmp/bpftime-fatbin-work.XXXXXX";
+		mkdtemp(tmp_dir);
+		auto working_dir = std::filesystem::path(tmp_dir);
+
+		SPDLOG_DEBUG("Writing patched PTX to {}", working_dir.c_str());
+		for (const auto &[file_name, ptx] : ptx_out) {
+			auto path = working_dir / (file_name);
+			std::ofstream ofs(path);
+			ofs << std::get<0>(ptx);
 		}
 	}
-	to_patch_ptx = wrap_ptx_with_trampoline(to_patch_ptx);
-	to_patch_ptx = filter_out_version_headers(to_patch_ptx);
-	{
-		// filter out comment lines
-		std::istringstream iss(to_patch_ptx);
-		std::ostringstream oss;
-		std::string line;
-		while (std::getline(iss, line)) {
-			if (line.starts_with("/"))
-				continue;
-			oss << line << std::endl;
-		}
-		to_patch_ptx = oss.str();
-	}
-	SPDLOG_INFO("Recompiling PTX with nvcc..");
-	char tmp_dir[] = "/tmp/bpftime-recompile-nvcc";
-	// mkdtemp(tmp_dir);
-	std::filesystem::path work_dir(tmp_dir);
-	if (!std::filesystem::exists(work_dir)) {
-		SPDLOG_INFO("Creating work dir: {}", work_dir.c_str());
-		std::filesystem::create_directories(work_dir);
-	}
-	SPDLOG_INFO("Working directory: {}", work_dir.c_str());
-	std::string command =
-		"nvcc -O2 -G -g --keep-device-functions -arch=sm_60 ";
-	{
-		auto ptx_in = work_dir / "main.ptx";
-		// SPDLOG_WARN("Using /tmp/main.ptx as ptx for nvcc");
-		// std::string ptx_in = "/tmp/main.ptx";
-		SPDLOG_INFO("PTX IN: {}", ptx_in.c_str());
-		std::ofstream ofs(ptx_in);
-		ofs << ptx_out[0];
-		command += ptx_in;
-		command += " ";
-	}
-	command += "-fatbin ";
-	auto fatbin_out = work_dir / "out.fatbin";
-	command += "-o ";
-	command += fatbin_out;
-	SPDLOG_INFO("Fatbin out {}", fatbin_out.c_str());
-	SPDLOG_INFO("Starting nvcc: {}", command);
-	if (int err = system(command.c_str()); err != 0) {
-		SPDLOG_ERROR("Unable to execute nvcc");
-		return {};
-	}
-	SPDLOG_INFO("NVCC execution done.");
-	std::vector<uint8_t> fatbin_out_buf;
-	{
-		std::ifstream ifs(fatbin_out, std::ios::binary | std::ios::ate);
-		auto file_tail = ifs.tellg();
-		ifs.seekg(0, std::ios::beg);
-
-		fatbin_out_buf.resize(file_tail);
-		ifs.read((char *)fatbin_out_buf.data(), file_tail);
-	}
-
-	SPDLOG_INFO("Got patched fatbin in {} bytes", fatbin_out_buf.size());
-	return fatbin_out_buf;
-}
-
-static uint64_t _constData_mock;
-static char map_basic_info_mock[4096];
-extern "C" {
-void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
-		       char *deviceAddress, const char *deviceName, int ext,
-		       size_t size, int constant, int global);
-}
-int nv_attach_impl::register_trampoline_memory(void **fatbin_handle)
-{
-	if (this->trampoline_memory_state !=
-	    TrampolineMemorySetupStage::NotSet) {
-		SPDLOG_INFO("Invalid stage for register trampoline memory");
-		return -1;
-	}
-	SPDLOG_INFO("Registering trampoline memory");
-
-	__cudaRegisterVar(fatbin_handle, (char *)&_constData_mock,
-			  (char *)"constData", "constData", 0,
-			  sizeof(_constData_mock), 1, 0);
-
-	__cudaRegisterVar(fatbin_handle, (char *)&map_basic_info_mock,
-			  (char *)"map_info", "map_info", 0,
-			  sizeof(map_basic_info_mock), 1, 0);
-	this->trampoline_memory_state = TrampolineMemorySetupStage::Registered;
-	SPDLOG_INFO("Register trampoline memory done");
-	return 0;
-}
-int nv_attach_impl::copy_data_to_trampoline_memory()
-{
-	SPDLOG_INFO("Copying data to device symbols..");
-	if (auto err = cudaMemcpyToSymbol((const void *)&_constData_mock,
-					  &this->shared_mem_ptr,
-					  sizeof(_constData_mock));
-	    err != cudaSuccess) {
-		SPDLOG_ERROR(
-			"Unable to copy `constData` (shared memory address) to device: {}",
-			(int)err);
-		return -1;
-	}
-	SPDLOG_INFO("Copying the followed map info:");
-	for (int i = 0; i < this->map_basic_info->size(); i++) {
-		const auto &cur = this->map_basic_info->at(i);
-		if (cur.enabled) {
-			SPDLOG_INFO(
-				"Mapid {}, enabled = {}, key_size = {}, value_size = {}, max_ent={}, type={}",
-				i, cur.enabled, cur.key_size, cur.value_size,
-				cur.max_entries, cur.map_type);
-		}
-	}
-	if (auto err = cudaMemcpyToSymbol((const void *)&map_basic_info_mock,
-					  this->map_basic_info->data(),
-					  sizeof(map_basic_info_mock));
-	    err != cudaSuccess) {
-		SPDLOG_ERROR("Unable to copy `map_basic_into` to device : {}",
-			     (int)err);
-		return -1;
-	}
-	this->trampoline_memory_state = TrampolineMemorySetupStage::Copied;
-	SPDLOG_INFO("constData and map_basic_info copied..");
-
-	return 0;
+	return ptx_out;
 }
 
 namespace bpftime::attach
 {
-std::string filter_unprintable_chars(std::string input)
-{
-	static const char non_printable_chars[] = {
-		'\0',	'\x01', '\x02', '\x03', '\x04', '\x05', '\x06', '\a',
-		'\b',	'\v',	'\f',	'\r',	'\x0E', '\x0F', '\x10', '\x11',
-		'\x12', '\x13', '\x14', '\x15', '\x16', '\x17', '\x18', '\x19',
-		'\x1A', '\x1B', '\x1C', '\x1D', '\x1E', '\x1F', '\x7F'
-	};
-	std::set<char> set(std::begin(non_printable_chars),
-			   std::end(non_printable_chars));
 
-	std::string result;
-	for (auto c : input) {
-		if (set.contains(c) || (uint8_t)c > 127)
-			continue;
-		result.push_back(c);
+int nv_attach_impl::find_attach_entry_by_program_name(const char *name) const
+{
+	for (const auto &entry : this->hook_entries) {
+		if (entry.second.program_name == name)
+			return entry.first;
 	}
-	while (result.back() != '}')
-		result.pop_back();
-	return result;
-};
+	return -1;
+}
+#define NVPTXCOMPILER_SAFE_CALL(x)                                             \
+	do {                                                                   \
+		nvPTXCompileResult result = x;                                 \
+		if (result != NVPTXCOMPILE_SUCCESS) {                          \
+			SPDLOG_ERROR("{} failed with error code {}", #x,       \
+				     (int)result);                             \
+			return -1;                                             \
+		}                                                              \
+	} while (0)
+#define CUDA_SAFE_CALL(x)                                                      \
+	do {                                                                   \
+		CUresult result = x;                                           \
+		if (result != CUDA_SUCCESS) {                                  \
+			const char *msg;                                       \
+			cuGetErrorName(result, &msg);                          \
+			SPDLOG_ERROR("{} failed with error {}", #x, msg);      \
+			return -1;                                             \
+		}                                                              \
+	} while (0)
+
+int nv_attach_impl::run_attach_entry_on_gpu(int attach_id, int run_count,
+					    int grid_dim_x, int grid_dim_y,
+					    int grid_dim_z, int block_dim_x,
+					    int block_dim_y, int block_dim_z)
+{
+	if (this->shared_mem_ptr == 0) {
+		SPDLOG_ERROR(
+			"shared_mem_ptr is not initialized; cannot run attach {} on GPU",
+			attach_id);
+		return -1;
+	}
+	if (run_count < 1) {
+		SPDLOG_ERROR("run_count must be greater than 0");
+		return -1;
+	}
+	std::vector<ebpf_inst> insts;
+	if (auto itr = hook_entries.find(attach_id);
+	    itr != hook_entries.end()) {
+		// In new flow, directly_run is not supported and should be
+		// represented by a dedicated pass
+		insts = itr->second.instuctions;
+	} else {
+		SPDLOG_ERROR("Invalid attach id {}", attach_id);
+		return -1;
+	}
+	SPDLOG_INFO("Running program on GPU");
+
+	// Get SM architecture (auto-detect or from BPFTIME_SM_ARCH env)
+	std::string sm_arch = get_gpu_sm_arch();
+	SPDLOG_INFO("Using SM architecture: {}", sm_arch);
+
+	std::vector<uint64_t> ebpf_words;
+	for (const auto &insts : insts) {
+		ebpf_words.push_back(*(uint64_t *)(uintptr_t)&insts);
+	}
+		auto ptx = ptxpass::filter_out_version_headers_ptx(
+			wrap_ptx_with_trampoline_for_sm(
+				filter_compiled_ptx_for_ebpf_program(
+					ptxpass::compile_ebpf_to_ptx_from_words(
+						ebpf_words, sm_arch.c_str(),
+						"bpf_main", false, false),
+					"bpf_main"),
+				sm_arch));
+	{
+		const std::string to_replace = ".func bpf_main";
+
+		// Replace ".func bpf_main" to ".visible .entry bpf_main" so it
+		// can be executed
+		auto bpf_main_pos = ptx.find(to_replace);
+		if (bpf_main_pos == ptx.npos) {
+			SPDLOG_ERROR("Cannot find '{}' in generated PTX code",
+				     to_replace);
+			return -1;
+		}
+		ptx = ptx.replace(bpf_main_pos, to_replace.size(),
+				  ".visible .entry bpf_main");
+	}
+	if (spdlog::get_level() <= SPDLOG_LEVEL_DEBUG) {
+		auto path = "/tmp/directly-run.ptx";
+
+		std::ofstream ofs(path);
+		ofs << ptx << std::endl;
+		SPDLOG_DEBUG("Dumped directly run ptx to {}", path);
+	}
+	// Compile to ELF
+	std::vector<char> output_elf;
+	{
+		unsigned int major_ver, minor_ver;
+		NVPTXCOMPILER_SAFE_CALL(
+			nvPTXCompilerGetVersion(&major_ver, &minor_ver));
+		SPDLOG_INFO("PTX compiler version {}.{}", major_ver, minor_ver);
+		nvPTXCompilerHandle compiler = nullptr;
+		NVPTXCOMPILER_SAFE_CALL(nvPTXCompilerCreate(
+			&compiler, (size_t)ptx.size(), ptx.c_str()));
+		std::string gpu_name_opt = "--gpu-name=" + sm_arch;
+		const char *compile_options[] = { gpu_name_opt.c_str(),
+						  "--verbose" };
+		auto status = nvPTXCompilerCompile(
+			compiler, std::size(compile_options), compile_options);
+		if (status != NVPTXCOMPILE_SUCCESS) {
+			size_t error_size;
+
+			NVPTXCOMPILER_SAFE_CALL(nvPTXCompilerGetErrorLogSize(
+				compiler, &error_size));
+
+			if (error_size != 0) {
+				std::string error_log(error_size + 1, '\0');
+				NVPTXCOMPILER_SAFE_CALL(
+					nvPTXCompilerGetErrorLog(
+						compiler, error_log.data()));
+				SPDLOG_ERROR("Unable to compile: {}",
+					     error_log);
+			}
+			return -1;
+		}
+		size_t compiled_size;
+		NVPTXCOMPILER_SAFE_CALL(nvPTXCompilerGetCompiledProgramSize(
+			compiler, &compiled_size));
+		output_elf.resize(compiled_size);
+		NVPTXCOMPILER_SAFE_CALL(nvPTXCompilerGetCompiledProgram(
+			compiler, (void *)output_elf.data()));
+		size_t info_size;
+		NVPTXCOMPILER_SAFE_CALL(
+			nvPTXCompilerGetInfoLogSize(compiler, &info_size));
+		std::string info_log(info_size + 1, '\0');
+		NVPTXCOMPILER_SAFE_CALL(
+			nvPTXCompilerGetInfoLog(compiler, info_log.data()));
+		SPDLOG_INFO("{}", info_log);
+	}
+	SPDLOG_INFO("Compiled program size: {}", output_elf.size());
+	// Load and run the program
+	{
+		CUdevice cuDevice;
+		CUcontext context;
+		CUmodule module;
+		CUfunction kernel;
+		CUDA_SAFE_CALL(cuInit(0));
+		CUDA_SAFE_CALL(cuDeviceGet(&cuDevice, 0));
+
+		CUDA_SAFE_CALL(cuCtxCreate(&context, 0, cuDevice));
+		CUDA_SAFE_CALL(cuModuleLoadDataEx(&module, output_elf.data(), 0,
+						  0, 0));
+		// fill data into it
+		{
+			CUdeviceptr ptr;
+			size_t bytes;
+			CUDA_SAFE_CALL(cuModuleGetGlobal(&ptr, &bytes, module,
+							 "constData"));
+			CUDA_SAFE_CALL(
+				cuMemcpyHtoD(ptr, &this->shared_mem_ptr,
+					     sizeof(this->shared_mem_ptr)));
+			SPDLOG_INFO(
+				"shared_mem_ptr copied: device ptr {:x}, device size {}",
+				(uintptr_t)ptr, bytes);
+		}
+		{
+			CUdeviceptr ptr;
+			size_t bytes;
+			CUDA_SAFE_CALL(cuModuleGetGlobal(&ptr, &bytes, module,
+							 "map_info"));
+			if (!this->map_basic_info.has_value()) {
+				SPDLOG_ERROR(
+					"map_basic_info is not set, cannot copy to device");
+				return -1;
+			}
+			CUDA_SAFE_CALL(cuMemcpyHtoD(
+				ptr, this->map_basic_info->data(),
+				sizeof(this->map_basic_info->at(0)) *
+					this->map_basic_info->size()));
+			SPDLOG_INFO(
+				"map_info copied: device ptr {:x}, device size {}",
+				(uintptr_t)ptr, bytes);
+		}
+		CUDA_SAFE_CALL(
+			cuModuleGetFunction(&kernel, module, "bpf_main"));
+		for (int i = 1; i <= run_count; i++) {
+			SPDLOG_INFO("Run {}", i);
+			CUDA_SAFE_CALL(cuLaunchKernel(
+				kernel, grid_dim_x, grid_dim_y, grid_dim_z,
+				block_dim_x, block_dim_y, block_dim_z, 0,
+				nullptr, nullptr, 0));
+			CUDA_SAFE_CALL(cuCtxSynchronize());
+		}
+	}
+	return 0;
+}
+
+void nv_attach_impl::mirror_cuda_memcpy_to_symbol(
+	const void *symbol, const void *src, size_t count, size_t offset,
+	cudaMemcpyKind kind, cudaStream_t stream, bool async)
+{
+	auto record_itr = symbol_address_to_fatbin.find((void *)symbol);
+	if (record_itr == symbol_address_to_fatbin.end()) {
+		SPDLOG_DEBUG(
+			"In mirror_cuda_memcpy_to_symbol: calling original cudaMemcpyToSymbol");
+		if (async) {
+			cudaMemcpyToSymbolAsync(symbol, src, count, offset,
+						kind, stream);
+		} else {
+			cudaMemcpyToSymbol(symbol, src, count, offset, kind);
+		}
+		return;
+	}
+	auto &record = *record_itr->second;
+	auto var_itr = record.variable_addr_to_symbol.find((void *)symbol);
+	if (var_itr == record.variable_addr_to_symbol.end()) {
+		SPDLOG_DEBUG(
+			"mirror_cuda_memcpy_to_symbol: no variable info for symbol pointer {:x}",
+			(uintptr_t)symbol);
+		return;
+	}
+	auto &var_info = var_itr->second;
+	if (offset >= var_info.size) {
+		SPDLOG_WARN(
+			"mirror_cuda_memcpy_to_symbol: offset {} exceeds size {} for symbol {}",
+			offset, var_info.size, var_info.symbol_name);
+		return;
+	}
+	size_t writable = var_info.size - offset;
+	size_t bytes_to_copy = std::min(count, writable);
+	if (bytes_to_copy == 0)
+		return;
+	if (bytes_to_copy != count) {
+		SPDLOG_WARN(
+			"mirror_cuda_memcpy_to_symbol: truncating copy for symbol {} (requested={}, allowed={})",
+			var_info.symbol_name, count, bytes_to_copy);
+	}
+	CUdeviceptr dst = var_info.ptr + offset;
+	CUstream cu_stream = reinterpret_cast<CUstream>(stream);
+	CUresult status = CUDA_SUCCESS;
+
+	auto copy_device_ptr = [](const void *ptr) -> CUdeviceptr {
+		return static_cast<CUdeviceptr>(
+			reinterpret_cast<uintptr_t>(ptr));
+	};
+
+	switch (kind) {
+	case cudaMemcpyHostToDevice:
+	case cudaMemcpyDefault:
+		status = async ? cuMemcpyHtoDAsync(dst, src, bytes_to_copy,
+						   cu_stream) :
+				 cuMemcpyHtoD(dst, src, bytes_to_copy);
+		break;
+	case cudaMemcpyDeviceToDevice:
+		status = async ? cuMemcpyDtoDAsync(dst, copy_device_ptr(src),
+						   bytes_to_copy, cu_stream) :
+				 cuMemcpyDtoD(dst, copy_device_ptr(src),
+					      bytes_to_copy);
+		break;
+	default:
+		SPDLOG_DEBUG(
+			"mirror_cuda_memcpy_to_symbol: unsupported memcpy kind {} for symbol {}",
+			(int)kind, var_info.symbol_name);
+		return;
+	}
+	if (status != CUDA_SUCCESS) {
+		SPDLOG_WARN(
+			"mirror_cuda_memcpy_to_symbol: failed to copy symbol {} (err={})",
+			var_info.symbol_name, (int)status);
+	}
+}
 
 } // namespace bpftime::attach

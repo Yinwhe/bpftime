@@ -107,9 +107,11 @@ int bpf_attach_ctx::init_attach_ctx_from_handlers(
 
 bpf_attach_ctx::~bpf_attach_ctx()
 {
-	SPDLOG_DEBUG("Destructor: bpf_attach_ctx");
+	SPDLOG_INFO("Destructor: bpf_attach_ctx");
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
 	cuda_ctx->cuda_watcher_should_stop->store(true);
+	if (cuda_watcher_thread.joinable())
+		cuda_watcher_thread.join();
 #endif
 }
 
@@ -264,9 +266,15 @@ int bpf_attach_ctx::instantiate_bpf_link_handler_at(
 		return -ENOTSUP;
 	}
 	auto prog = instantiated_progs.at(handler.prog_id).get();
+	SPDLOG_DEBUG(
+		"Instantiating bpf link {}, bpftime_prog->prog_name() = {}", id,
+		prog->prog_name());
 	int attach_id;
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
 	if (prog->is_cuda()) {
+		SPDLOG_INFO(
+			"Instantiating bpf link {} and the corresponding program {} is cuda program",
+			id, prog->prog_name());
 		if (handle_nv_attach_impl) {
 			SPDLOG_INFO(
 				"Handling link to CUDA program: {}, recording it..",
@@ -274,14 +282,15 @@ int bpf_attach_ctx::instantiate_bpf_link_handler_at(
 			auto &nv_attach_private_data =
 				dynamic_cast<attach::nv_attach_private_data &>(
 					*priv_data);
+			nv_attach_private_data.program_name = prog->prog_name();
 			nv_attach_private_data.comm_shared_mem =
-				(uintptr_t)this->cuda_ctx->cuda_shared_mem.get();
+				this->cuda_ctx->cuda_shared_mem_device_pointer;
 			nv_attach_private_data.instructions = prog->get_insns();
 			SPDLOG_INFO(
 				"Loaded {} instructions (original) for cuda ebpf program",
 				prog->get_insns().size());
 			nv_attach_private_data.map_basic_info =
-				this->create_map_basic_info(256);
+				this->create_map_basic_info(1024);
 			attach_id =
 				attach_impl->create_attach_with_ebpf_callback(
 					[=](void *mem, size_t mem_size,
@@ -296,6 +305,16 @@ int bpf_attach_ctx::instantiate_bpf_link_handler_at(
 	} else
 #endif
 	{
+#ifdef BPFTIME_ENABLE_CUDA_ATTACH
+		if (auto p = dynamic_cast<attach::nv_attach_private_data *>(
+			    priv_data.get());
+		    p) {
+			SPDLOG_ERROR(
+				"A CUDA attach must be used with a CUDA program (program with name starts with `cuda__`), not {}",
+				prog->prog_name());
+			return -1;
+		}
+#endif
 		auto cookie = handler.attach_cookie;
 		attach_id = attach_impl->create_attach_with_ebpf_callback(
 			[=](void *mem, size_t mem_size, uint64_t *ret) -> int {

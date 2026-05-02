@@ -39,7 +39,10 @@ struct bpf_map_attr {
 
 	// additional fields for bpftime only
 	uint32_t kernel_bpf_map_id = 0;
-	uint32_t gpu_thread_count = 1000;
+	// Default maximum GPU "thread" count used when sizing GPU maps.
+	// A smaller default keeps shared memory usage reasonable; users can
+	// override via BPFTIME_MAP_GPU_THREAD_COUNT when needed.
+	uint64_t gpu_thread_count = 1024;
 };
 
 enum class bpf_event_type {
@@ -116,8 +119,18 @@ enum class bpf_map_type {
 	BPF_MAP_TYPE_KERNEL_USER_PERF_EVENT_ARRAY =
 		KERNEL_USER_MAP_OFFSET + BPF_MAP_TYPE_PERF_EVENT_ARRAY,
 
-	BPF_MAP_TYPE_NV_GPU_ARRAY_MAP = GPU_MAP_OFFSET + BPF_MAP_TYPE_ARRAY,
-	BPF_MAP_TYPE_NV_GPU_RINGBUF_MAP = GPU_MAP_OFFSET + BPF_MAP_TYPE_RINGBUF,
+	BPF_MAP_TYPE_GPU_HASH_MAP = GPU_MAP_OFFSET + BPF_MAP_TYPE_HASH,
+	// GPU maps using cuMemAlloc + CUDA IPC (for x86 with IPC support)
+	BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP = GPU_MAP_OFFSET + BPF_MAP_TYPE_ARRAY,
+	BPF_MAP_TYPE_GPU_ARRAY_MAP = GPU_MAP_OFFSET + BPF_MAP_TYPE_ARRAY + 1,
+	BPF_MAP_TYPE_GPU_KERNEL_SHARED_ARRAY_MAP =
+		GPU_MAP_OFFSET + BPF_MAP_TYPE_ARRAY + 2,
+	BPF_MAP_TYPE_GPU_RINGBUF_MAP = GPU_MAP_OFFSET + BPF_MAP_TYPE_RINGBUF,
+
+	// GPU maps using boost::interprocess + cudaHostRegister (for Tegra/platforms without IPC)
+	BPF_MAP_TYPE_PERGPUTD_ARRAY_HOST_MAP = GPU_MAP_OFFSET + BPF_MAP_TYPE_ARRAY + 10,
+	BPF_MAP_TYPE_GPU_ARRAY_HOST_MAP = GPU_MAP_OFFSET + BPF_MAP_TYPE_ARRAY + 11,
+
 	BPF_MAP_TYPE_MAX = 2048,
 };
 
@@ -411,6 +424,8 @@ int bpftime_poll_gpu_ringbuf_map(int mapfd, void *ctx,
 				 void (*)(const void *, uint64_t, void *));
 #endif
 int bpftime_add_memfd_handler(const char *name, int flags);
+int bpftime_translate_shared_map_type_to_kernel_map_type(int ty);
+
 }
 
 #endif // BPFTIME_SHM_CPP_H

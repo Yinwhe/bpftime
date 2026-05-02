@@ -79,8 +79,6 @@ syscall_hooker_func_t orig_hooker;
 
 extern "C" void bpftime_agent_main(const gchar *data, gboolean *stay_resident);
 
-#ifndef BPFTIME_ENABLE_CUDA_ATTACH
-
 extern "C" int bpftime_hooked_main(int argc, char **argv, char **envp)
 {
 	int stay_resident = 0;
@@ -103,7 +101,6 @@ extern "C" int __libc_start_main(int (*main)(int, char **, char **), int argc,
 	return orig(bpftime_hooked_main, argc, argv, init, fini, rtld_fini,
 		    stack_end);
 }
-#endif
 static void sig_handler_sigusr1_detach(int sig)
 {
 	SPDLOG_INFO("Detaching..");
@@ -118,12 +115,23 @@ static void sig_handler_sigusr1_detach(int sig)
 	bpftime_logger_flush();
 }
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
+namespace bpftime::vm::compat
+{
+namespace llvm
+{
+void register_llvm_vm_factory();
+}
+} // namespace bpftime::vm::compat
 void **(*original___cudaRegisterFatBinary)(void *) = nullptr;
 
 extern "C" void **__cudaRegisterFatBinary(void *fatbin)
 {
 	auto orig = try_get_original_func("__cudaRegisterFatBinary",
 					  original___cudaRegisterFatBinary);
+	// We have to register llvmbpf manually, since this function
+	// (__cudaRegisterFatBinary) might be called before llvm is registered
+
+	bpftime::vm::compat::llvm::register_llvm_vm_factory();
 	gboolean flag = false;
 	bpftime_agent_main(nullptr, &flag);
 	return orig(fatbin);

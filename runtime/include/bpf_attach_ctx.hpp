@@ -34,6 +34,15 @@ namespace bpftime
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
 namespace cuda
 {
+struct CommSharedMem;
+}
+#endif
+
+#ifdef BPFTIME_ENABLE_CUDA_ATTACH
+namespace cuda
+{
+// The old 1<<30 value makes the shared segment too large for Boost IPC.
+static constexpr std::size_t GPU_HELPER_MAX_BUF = 1 << 24;
 
 enum class HelperOperation {
 	MAP_LOOKUP = 1,
@@ -47,15 +56,15 @@ enum class HelperOperation {
 
 union HelperCallRequest {
 	struct {
-		char key[1 << 30];
+		char key[GPU_HELPER_MAX_BUF];
 	} map_lookup;
 	struct {
-		char key[1 << 30];
-		char value[1 << 30];
+		char key[GPU_HELPER_MAX_BUF];
+		char value[GPU_HELPER_MAX_BUF];
 		uint64_t flags;
 	} map_update;
 	struct {
-		char key[1 << 30];
+		char key[GPU_HELPER_MAX_BUF];
 	} map_delete;
 
 	struct {
@@ -97,11 +106,11 @@ struct CUDAContext {
 		std::make_shared<std::atomic<bool>>(false);
 
 	// Shared memory region for CUDA
-	std::unique_ptr<cuda::CommSharedMem> cuda_shared_mem;
+	cuda::CommSharedMem *cuda_shared_mem;
 	// Mapped device pointer
 	uintptr_t cuda_shared_mem_device_pointer;
 
-	CUDAContext(std::unique_ptr<cuda::CommSharedMem> &&mem);
+	CUDAContext(cuda::CommSharedMem *mem);
 
 	CUDAContext(CUDAContext &&) = default;
 	CUDAContext &operator=(CUDAContext &&) = default;
@@ -112,6 +121,24 @@ struct CUDAContext {
 };
 
 std::optional<std::unique_ptr<cuda::CUDAContext>> create_cuda_context();
+
+inline std::atomic<uintptr_t> &cuda_shared_mem_device_pointer_storage() noexcept
+{
+	static std::atomic<uintptr_t> value{ 0 };
+	return value;
+}
+
+inline void set_cuda_shared_mem_device_pointer(uintptr_t ptr) noexcept
+{
+	cuda_shared_mem_device_pointer_storage().store(ptr,
+						      std::memory_order_release);
+}
+
+inline uintptr_t get_cuda_shared_mem_device_pointer() noexcept
+{
+	return cuda_shared_mem_device_pointer_storage().load(
+		std::memory_order_acquire);
+}
 
 } // namespace cuda
 #endif
@@ -199,13 +226,19 @@ class bpf_attach_ctx {
 					    bool handle_nv_attach_impl);
 	int instantiate_perf_event_handler_at(
 		int id, const bpf_perf_event_handler &perf_handler);
+
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
 	// Start host thread for handling map requests from CUDA
 	void start_cuda_watcher_thread();
 	std::unique_ptr<cuda::CUDAContext> cuda_ctx;
+	std::thread cuda_watcher_thread;
 
 	std::vector<attach::MapBasicInfo>
 	create_map_basic_info(int filled_size);
+	// Lookup nv_attach_impl from stored attach_impls
+    public:
+	std::optional<attach::nv_attach_impl *> find_nv_attach_impl() const;
+
 #endif
 };
 
