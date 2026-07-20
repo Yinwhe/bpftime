@@ -3,7 +3,7 @@ name: Build and test runtime
 on:
   workflow_dispatch:
   push:
-    branches: ["master", "issue-421-runtime-library"]
+    branches: ["master"]
     paths:
       - ".github/workflows/test-runtime.yml"
       - "attach/**"
