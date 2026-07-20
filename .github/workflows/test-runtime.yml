@@ -3,11 +3,12 @@ name: Build and test runtime
 on:
   workflow_dispatch:
   push:
-    branches: ["master"]
+    branches: ["master", "issue-421-runtime-library"]
     paths:
       - ".github/workflows/test-runtime.yml"
       - "attach/**"
       - "example/malloc/**"
+      - "example/runtime-library/**"
       - "runtime/**"
       - "vm/**"
       - "cmake/**"
@@ -20,6 +21,7 @@ on:
       - ".github/workflows/test-runtime.yml"
       - "attach/**"
       - "example/malloc/**"
+      - "example/runtime-library/**"
       - "runtime/**"
       - "vm/**"
       - "cmake/**"
@@ -122,6 +124,12 @@ jobs:
         run: |
           export BPFTIME_VM_NAME=llvm
           ./build/runtime/unit-test/bpftime_runtime_tests
+      - name: Build direct runtime library example (Ubuntu/Fedora)
+        if: matrix.container != 'openeuler-2403sp2'
+        run: cmake --build build --config Debug --target bpftime_runtime_library_example -j$(nproc)
+      - name: Run direct runtime library example (Ubuntu/Fedora)
+        if: matrix.container != 'openeuler-2403sp2'
+        run: ./build/example/runtime-library/bpftime_runtime_library_example
       - name: Build runtime libs for example (openEuler)
         if: matrix.container == 'openeuler-2403sp2'
         run: |

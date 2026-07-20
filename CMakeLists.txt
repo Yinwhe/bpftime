@@ -246,6 +246,9 @@ endif()
 
 add_subdirectory(tools)
 
+# Small in-process example for embedding the runtime/handler libraries.
+add_subdirectory(example/runtime-library)
+
 if(${BUILD_ATTACH_IMPL_EXAMPLE})
   add_subdirectory(example/attach_implementation)
 endif()
